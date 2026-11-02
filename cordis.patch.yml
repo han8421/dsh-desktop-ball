@@ -1,0 +1,5 @@
+# This layer is applied when a profile lists dsh-desktop-ball in dsh.profile.bundles.
+# Rows reference the package by name, not by path, so Node resolves the installed code.
+- insert:
+    - id: quick-chat
+      name: dsh-desktop-ball

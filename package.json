@@ -1,0 +1,73 @@
+{
+  "name": "dsh-desktop-ball",
+  "version": "0.18.0",
+  "description": "桌面悬浮球：Windows 桌面悬浮球 + WebView2 聊天窗口，支持模型、权限、推理等级切换，图片/附件上传，图标裁剪、形状、大小、聊天背景区域与消息颜色自定义。",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/han8421/dsh-desktop-ball.git"
+  },
+  "homepage": "https://github.com/han8421/dsh-desktop-ball#readme",
+  "bugs": {
+    "url": "https://github.com/han8421/dsh-desktop-ball/issues"
+  },
+  "author": "han8421",
+  "icon": "icon.png",
+  "os": [
+    "win32"
+  ],
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.png"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.png",
+    "native/*.ps1",
+    "native/webview2/*",
+    "README.md",
+    "LICENSE",
+    "docs/*",
+    "screenshots.json"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "desktop-ball",
+    "quick-chat",
+    "floating-window",
+    "desktop"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller",
+        "@deepseek-ai/dsh-client-file-upload",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

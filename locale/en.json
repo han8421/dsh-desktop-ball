@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Desktop Floating Ball",
+    "description": "A Windows desktop floating ball with an embedded WebView2 chat window: model, permission and reasoning switching, image/file attachments, icon cropping, shape, size, chat background region, message colors and assistant name customization."
+  }
+}
