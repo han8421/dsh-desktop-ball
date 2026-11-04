@@ -1,6 +1,6 @@
 <div align="center">
 <img src="icon.png" width="88" alt="Desktop Floating Ball" />
-<h1>桌面悬浮球</h1>
+<h1>dsh-desktop-ball</h1>
 <p><b>给 DeepSeek Harness 加一颗可自定义 图标和背景 的桌面悬浮球：点一下，在独立窗口里对话。</b></p>
 <p>
 <a href="#兼容性"><img src="https://img.shields.io/badge/DeepSeek%20Harness-0.2.x-4d6bfe" alt="DeepSeek Harness 0.2.x"></a>
@@ -25,7 +25,7 @@
 
 ## 这是什么
 
-**桌面悬浮球**（Desktop Floating Ball / `dsh-desktop-ball`）是一个 DeepSeek Harness 插件。它在 Windows 桌面上放一颗透明、置顶的小球，点一下就在独立窗口里打开 DSH 对话，不用切回主窗口。
+**桌面悬浮球**（Desktop Floating Ball / `dsh-desktop-ball`）是一个 DeepSeek Harness 插件。它在 Windows 桌面上放一颗可自定义的、置顶的小球，点一下就在独立窗口里打开 DSH 对话，不用切回主窗口。
 
 如果你常常只是「想问一句就走」，它省掉的就是找窗口、还原窗口、再关掉窗口的那几步。
 
