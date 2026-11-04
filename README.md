@@ -40,7 +40,7 @@
 - 🖱️ **单击开窗，双击隐藏**：隐藏只收起窗口，WebView 和当前对话都保留，再点一下立即恢复，不会重新初始化。
 - 🎨 **外观全可换**：图标（图片 / GIF / 视频 / 纯色）、裁剪、形状、大小、聊天背景区域、消息颜色、助手名称。
 - ⚡ **预热**：鼠标移到球上，窗口已在屏幕外开始加载；点击时通常已经加载完成。
-- 🧠 **输入区与主界面一致**：模型、权限、推理等级、关闭思考，图片 / 附件上传与拖拽，流式回复与停止。细节见 [输入区](docs/composer.md)。
+- 🧠 **输入区与主界面一致**：模型、权限、推理等级、关闭思考，图片 / 附件上传、拖拽与剪贴板粘贴截图，流式回复与停止。细节见 [输入区](docs/composer.md)。
 - 🌐 **界面语言**：跟随 DSH / 中文 / English，只影响插件页面与快捷窗口文案。
 - ✅ **提问和审批不出窗**：`ask_user_question` 卡片与 `approval/request` 都能在小窗内处理，主窗口和快捷窗口谁先响应谁生效。
 - 🪟 **自动回退**：缺少 WebView2 时退回 Edge / Chrome `--app` 窗口；macOS / Linux / 浏览器用 `Alt + Q` 打开应用内面板。
@@ -180,6 +180,11 @@ dsh-desktop-ball/
 ## 命名与兼容
 
 插件展示名与 npm 包名是 **桌面悬浮球 / Desktop Floating Ball**、`dsh-desktop-ball`。为保住升级后的聊天记录、外观和窗口位置，以下内部标识仍沿用旧名 `dsh-quick-chat`：数据目录、外观路由 `/dsh-quick-chat-appearance`、认证 fragment `#dsh-quick-chat=`、localStorage key。做法与迁移建议见 [架构 § 命名](docs/architecture.md#命名与兼容)。
+
+## 开发验证
+
+源码目录可运行 `npm.cmd run check` 和 `npm.cmd test`，无需安装额外测试依赖。
+测试覆盖范围、Windows 进程测试说明和发布前实机检查项见 [验证与回归](docs/testing.md)。
 
 ## License
 

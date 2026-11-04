@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } = React
 
     const PLUGIN_ID = 'dsh-desktop-ball'
-    const VERSION = '0.18.0'
+    const VERSION = '0.18.1'
     // Keep the original storage key so upgrading users retain history and preferences.
     const STORAGE_KEY = 'dsh-quick-chat.prefs.v1'
     const PANEL_MIN_WIDTH = 340
@@ -1754,19 +1754,30 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
         }
       }
 
-      applySessionPreferences() {
+      async applySessionPreferences() {
         const state = this.store.get()
         const session = this.session
         if (!session) return
-        if (state.permission) {
-          Promise.resolve(session.command(`/permission ${state.permission}`)).catch(() => undefined)
-        }
-        if (state.modelSelection) {
-          try {
-            Promise.resolve(this.requestSelectModel(session.sessionId, state.modelSelection)).catch(() => undefined)
-          } catch {
-            /* model selection is optional for a newly created session */
+        try {
+          if (state.permission) {
+            const result = await session.command(`/permission ${state.permission}`)
+            if (!result || result.ok === false || result.value?.matched === false) {
+              throw new Error(this.tr('权限设置未生效', 'Permission settings were not applied'))
+            }
           }
+          if (state.modelSelection) {
+            const result = await this.requestSelectModel(session.sessionId, state.modelSelection)
+            if (!result || result.ok === false) {
+              throw new Error(result?.error?.message || this.tr('模型设置未生效', 'Model settings were not applied'))
+            }
+          }
+          if (this.session !== session) throw new Error(this.tr('会话已切换，请重新发送', 'Session changed; please send again'))
+          this.preferencesPendingSession = null
+        } catch (error) {
+          const message = this.tr('会话设置失败，消息尚未发送：', 'Session settings failed; message not sent: ') + formatFailure(error)
+          this.store.set({ error: message, errorKind: 'preferences' })
+          this.notify(message)
+          throw error
         }
       }
 
@@ -2362,8 +2373,8 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
       }
 
       async ensureSession() {
-        if (this.session) return this.session
         if (this.ensurePromise) return this.ensurePromise
+        if (this.session) return this.session
         this.ensurePromise = (async () => {
           const currentId = this.store.get().sessionId
           if (currentId) {
@@ -2384,7 +2395,8 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
           this.rememberSession(created)
           this.store.set({ sessionId: created, title: '', messages: [], streamingText: '', running: false, error: '', hasSession: true })
           await this.attach(created)
-          this.applySessionPreferences()
+          this.preferencesPendingSession = created
+          await this.applySessionPreferences()
           return this.session
         })()
           .catch((error) => {
@@ -2849,6 +2861,13 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
             return
           }
         }
+        // Wait for new-session settings before submitting, including a retry after failure.
+        try {
+          if (this.ensurePromise) await this.ensurePromise
+          if (this.preferencesPendingSession === session.sessionId) await this.applySessionPreferences()
+          if (this.session !== session) return
+        } catch { return }
+        if (this.store.get().busy) return
         this.store.set({ busy: true, error: '', errorKind: '' })
         let handle = null
         try {
@@ -4503,6 +4522,25 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
             'data-dqc-input': '',
             disabled,
             onChange: (event) => controller.setDraft(event.target.value),
+            onPaste: (event) => {
+              const clipboard = event.clipboardData
+              if (!clipboard) return
+              const files = []
+              for (const item of Array.from(clipboard.items || [])) {
+                if (!item || item.kind !== 'file') continue
+                const file = item.getAsFile()
+                if (file && file.size > 0) files.push(file)
+              }
+              if (files.length === 0) {
+                for (const file of Array.from(clipboard.files || [])) {
+                  if (file && file.size > 0) files.push(file)
+                }
+              }
+              if (files.length > 0) {
+                event.preventDefault()
+                controller.addFiles(files)
+              }
+            },
             onFocus: () => setFocused(true),
             onBlur: () => setFocused(false),
             onKeyDown,

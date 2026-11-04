@@ -21,6 +21,8 @@ import { basename, extname, join, resolve, sep } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
+import { parseByteRange, pruneMedia } from './lib/reliability.js'
+
 export const name = 'quick-chat'
 
 /** The Host needs the authenticated browser origin and its loopback server. */
@@ -76,7 +78,7 @@ function writeState(root, value) {
 
 /** Appearance file shared by the WPF ball (writer/reader) and the web client (read-only). */
 const APPEARANCE_ROUTE = '/dsh-quick-chat-appearance'
-const CLIENT_VERSION = '0.18.0'
+const CLIENT_VERSION = '0.18.1'
 
 function appearanceFilePath(root) {
   return join(root, 'appearance.json')
@@ -99,6 +101,7 @@ function writeAppearance(root, value) {
   const temp = file + '.tmp'
   writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
   renameSync(temp, file)
+  pruneMedia(root, value, error => logHost(`media cleanup failed: ${error.message}`))
 }
 
 function ballShapeOf(value, fallback = 'circle') {
@@ -490,15 +493,14 @@ function createAppearanceHandler(root, ctx) {
         return
       }
       const size = statSync(file).size
-      const range = typeof req.headers.range === 'string' ? /^bytes=(\d*)-(\d*)$/.exec(req.headers.range) : null
+      const range = parseByteRange(req.headers.range, size)
+      if (range === false) {
+        res.writeHead(416, { 'content-range': `bytes */${size}` })
+        res.end()
+        return
+      }
       if (range) {
-        const start = range[1] ? Number(range[1]) : 0
-        const end = range[2] ? Number(range[2]) : size - 1
-        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= size) {
-          res.writeHead(416, { 'content-range': `bytes */${size}` })
-          res.end()
-          return
-        }
+        const { start, end } = range
         res.writeHead(206, {
           'content-type': contentTypeOf(file),
           'cache-control': 'no-cache',
@@ -603,11 +605,6 @@ function createAppearanceHandler(root, ctx) {
           }
         }
         writeAppearance(root, next)
-        try {
-          if (isOwnMediaFile(root, entry.file)) rmSync(entry.file, { force: true })
-        } catch {
-          /* best effort */
-        }
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(JSON.stringify({ ok: true }))
       } catch (error) {
@@ -692,7 +689,7 @@ function createAppearanceHandler(root, ctx) {
         }
         const media = join(root, 'media')
         mkdirSync(media, { recursive: true })
-        const file = join(media, `${target === 'ball' ? 'ball' : 'chat-bg'}-${Date.now()}${ext}`)
+        const file = join(media, `${target === 'ball' ? 'ball' : 'chat-bg'}-${Date.now()}-${randomBytes(6).toString('hex')}${ext}`)
         writeFileSync(file, data)
         const next = { ...readAppearance(root) }
         if (target === 'ball') {
@@ -747,29 +744,29 @@ function createAppearanceHandler(root, ctx) {
   }
 }
 
+function controlHelper(root, pid, terminate = false) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const script = fileURLToPath(new URL('./native/helper-control.ps1', import.meta.url))
+  const helper = fileURLToPath(new URL('./native/ball.ps1', import.meta.url))
+  const result = spawnSync(powershell, [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
+    '-HelperPid', String(pid), '-HelperScript', helper, '-StateFile', join(root, 'state.json'),
+    ...(terminate ? ['-Terminate'] : []),
+  ], { windowsHide: true, encoding: 'utf8', timeout: 8000 })
+  return result.status === 0 && String(result.stdout).trim() === 'verified'
+}
+
 function isHelperAlive(root) {
-  try {
-    const pid = Number(readFileSync(join(root, 'ball.pid'), 'utf8').trim())
-    if (!Number.isSafeInteger(pid) || pid <= 0) return false
-    const result = spawnSync('tasklist.exe', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
-      windowsHide: true,
-      encoding: 'utf8',
-    })
-    return result.status === 0 && String(result.stdout || '').includes(String(pid))
-  } catch {
-    return false
-  }
+  try { return controlHelper(root, Number(readFileSync(join(root, 'ball.pid'), 'utf8').trim())) }
+  catch { return false }
 }
 
 function killPreviousHelper(root) {
   try {
     const pid = Number(readFileSync(join(root, 'ball.pid'), 'utf8').trim())
-    if (Number.isSafeInteger(pid) && pid > 0) {
-      spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
-    }
-  } catch {
-    /* no previous helper */
-  }
+    if (!controlHelper(root, pid, true)) logHost('previous helper not terminated: identity unavailable or mismatched')
+  } catch { /* no previous helper */ }
 }
 
 /**
@@ -834,19 +831,16 @@ function startDesktopBall(ctx) {
   return () => {
     if (disposed) return
     disposed = true
+    controlHelper(root, child.pid, true)
+    // An older instance must not remove a replacement host's state or PID file.
     try {
-      child.kill()
-    } catch {
-      /* noop */
+      const current = JSON.parse(readFileSync(statePath, 'utf8'))
+      if (current.url !== state.url) return
+      rmSync(pidPath, { force: true })
+      rmSync(statePath, { force: true })
+    } catch (error) {
+      if (error.code !== 'ENOENT') logHost(`helper state cleanup failed: ${error.message}`)
     }
-    try {
-      const pid = Number(readFileSync(pidPath, 'utf8').trim())
-      if (Number.isSafeInteger(pid) && pid > 0) spawnSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
-    } catch {
-      /* noop */
-    }
-    rmSync(pidPath, { force: true })
-    rmSync(statePath, { force: true })
   }
 }
 

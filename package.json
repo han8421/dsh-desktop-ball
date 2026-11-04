@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-ball",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "桌面悬浮球：Windows 桌面悬浮球 + WebView2 聊天窗口，支持模型、权限、推理等级切换，图片/附件上传，图标裁剪、形状、大小、聊天背景区域与消息颜色自定义。",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/*.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.png",
@@ -69,5 +70,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test tests/*.test.mjs"
   }
 }
