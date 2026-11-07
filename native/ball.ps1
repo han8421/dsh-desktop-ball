@@ -524,26 +524,84 @@ function Set-BallImage {
 function Set-BallGif {
   param([string]$File)
   Stop-BallMedia
-  $uri = New-Object System.Uri($File, [System.UriKind]::Absolute)
-  $decoder = [System.Windows.Media.Imaging.GifBitmapDecoder]::new(
-    $uri,
-    [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-    [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-  )
-  $frames = @($decoder.Frames)
-  if ($frames.Count -eq 0) { throw 'GIF 没有可播放的帧' }
-  $delays = @()
-  foreach ($frame in $frames) {
-    $delay = 100
-    try {
-      $meta = $frame.Metadata
-      if ($meta -is [System.Windows.Media.Imaging.BitmapMetadata]) {
-        $raw = $meta.GetQuery('/grctlext/Delay')
-        if ($null -ne $raw -and [int]$raw -gt 0) { $delay = [int]$raw * 10 }
+
+  # WPF's GifBitmapDecoder returns wrong palettes for frames after the first
+  # (the image turns into a black/white dither). GDI+ composites GIF frames
+  # correctly, so decode there and hand plain BGRA frames to WPF.
+  $image = [System.Drawing.Image]::FromFile($File)
+  try {
+    if (-not $image.FrameDimensionsList -or $image.FrameDimensionsList.Count -eq 0) {
+      throw 'GIF 没有可播放的帧'
+    }
+    $dimension = New-Object System.Drawing.Imaging.FrameDimension($image.FrameDimensionsList[0])
+    $count = [int]$image.GetFrameCount($dimension)
+    if ($count -le 0) { throw 'GIF 没有可播放的帧' }
+
+    $maxSide = 256.0
+    $scale = [Math]::Min([double]1, $maxSide / [Math]::Max([double]$image.Width, [double]$image.Height))
+    $targetWidth = [Math]::Max(1, [int][Math]::Round([double]$image.Width * $scale))
+    $targetHeight = [Math]::Max(1, [int][Math]::Round([double]$image.Height * $scale))
+
+    $delayProperty = $null
+    try { $delayProperty = $image.GetPropertyItem(0x5100) } catch { }
+
+    $frames = @()
+    $delays = @()
+    for ($index = 0; $index -lt $count; $index++) {
+      [void]$image.SelectActiveFrame($dimension, $index)
+      $bitmap = New-Object System.Drawing.Bitmap($targetWidth, $targetHeight, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+      try {
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        try {
+          $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+          $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+          $graphics.DrawImage($image, 0, 0, $targetWidth, $targetHeight)
+        } finally {
+          $graphics.Dispose()
+        }
+
+        $rect = New-Object System.Drawing.Rectangle(0, 0, $targetWidth, $targetHeight)
+        $data = $bitmap.LockBits(
+          $rect,
+          [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+          [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+        )
+        try {
+          $stride = [Math]::Abs([int]$data.Stride)
+          $buffer = New-Object byte[] ($stride * $targetHeight)
+          [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $buffer, 0, $buffer.Length)
+        } finally {
+          $bitmap.UnlockBits($data)
+        }
+
+        $source = [System.Windows.Media.Imaging.BitmapSource]::Create(
+          $targetWidth,
+          $targetHeight,
+          96,
+          96,
+          [System.Windows.Media.PixelFormats]::Bgra32,
+          $null,
+          $buffer,
+          $stride
+        )
+        $source.Freeze()
+        $frames += $source
+      } finally {
+        $bitmap.Dispose()
       }
-    } catch { }
-    $delays += [Math]::Max(30, $delay)
+
+      $delay = 100
+      if ($delayProperty -and $delayProperty.Value -and $delayProperty.Value.Length -ge (($index + 1) * 4)) {
+        $centiseconds = [BitConverter]::ToInt32($delayProperty.Value, $index * 4)
+        if ($centiseconds -gt 0) { $delay = $centiseconds * 10 }
+      }
+      $delays += [Math]::Max(30, $delay)
+    }
+  } finally {
+    $image.Dispose()
   }
+
+  if ($frames.Count -eq 0) { throw 'GIF 没有可播放的帧' }
   $script:gifFrames = $frames
   $script:gifDelays = $delays
   $script:gifIndex = 0
