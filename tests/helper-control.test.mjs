@@ -10,6 +10,7 @@ test('helper inspection rejects wrong script/state and only stops the verified t
   const root=mkdtempSync(join(tmpdir(),'dsh helper test-'))
   const script=join(root,'ball.ps1'), state=join(root,'state.json')
   writeFileSync(script,'param([string]$StatePath)\nWrite-Output "ready"\nStart-Sleep -Seconds 60\n')
+  writeFileSync(state,'{}')
   const ps=join(process.env.SystemRoot,'System32/WindowsPowerShell/v1.0/powershell.exe')
   const child=spawn(ps,['-NoProfile','-ExecutionPolicy','Bypass','-File',script,'-StatePath',state],{windowsHide:true,stdio:['ignore','pipe','pipe']})
   const exited=new Promise(resolve=>child.once('exit',resolve))

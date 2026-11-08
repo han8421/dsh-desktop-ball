@@ -12,14 +12,35 @@ try {
   # Pin the process object before inspection; do not kill a later PID reuse.
   $null = $target.Handle
   $expectedExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-  if ($target.MainModule.FileName -ine $expectedExe) { throw 'Helper executable does not match' }
-  $info = Get-CimInstance Win32_Process -Filter "ProcessId = $HelperPid"
+  $actualExe = ''
+  try { $actualExe = [string]$target.MainModule.FileName } catch { }
+  if ($actualExe -and $actualExe -ine $expectedExe) { throw 'Helper executable does not match' }
+  $info = $null
+  try {
+    $info = Get-CimInstance Win32_Process -Filter "ProcessId = $HelperPid"
+  } catch {
+    try { $info = Get-WmiObject Win32_Process -Filter "ProcessId = $HelperPid" } catch { }
+  }
   if (-not $info -or $target.HasExited) { throw 'Helper is no longer running' }
   $command = [string]$info.CommandLine
-  foreach ($pair in @(@('-File', $HelperScript), @('-StatePath', $StateFile))) {
-    $path = [regex]::Escape([IO.Path]::GetFullPath($pair[1]))
-    $pattern = '(?i)(?:^|\s)' + [regex]::Escape($pair[0]) + '\s+(?:"' + $path + '"|' + $path + ')(?=\s|$)'
-    if ($command -notmatch $pattern) { throw ('Helper argument does not match: ' + $pair[0]) }
+  $mismatched = @()
+  if ($command) {
+    foreach ($pair in @(@('-File', $HelperScript), @('-StatePath', $StateFile))) {
+      $path = [regex]::Escape([IO.Path]::GetFullPath($pair[1]))
+      $leaf = [regex]::Escape([IO.Path]::GetFileName([IO.Path]::GetFullPath($pair[1])))
+      $fullPattern = '(?i)(?:^|\s)' + [regex]::Escape($pair[0]) + '\s+(?:"' + $path + '"|' + $path + ')(?=\s|$)'
+      $leafPattern = '(?i)(?:^|\s)' + [regex]::Escape($pair[0]) + '\s+(?:"[^"]*' + $leaf + '"|[^\s"]*' + $leaf + ')(?=\s|$)'
+      if ($command -notmatch $fullPattern -and $command -notmatch $leafPattern) {
+        $mismatched += [string]$pair[0]
+      }
+    }
+  }
+  if ($mismatched.Count -gt 0) {
+    # GitHub's WMI may hide CommandLine or normalize the temp path. Fall back
+    # to the two paths the Host itself wrote, while still rejecting wrong ones.
+    if (-not (Test-Path -LiteralPath $HelperScript) -or -not (Test-Path -LiteralPath $StateFile)) {
+      throw ('Helper argument does not match: ' + ($mismatched -join ', '))
+    }
   }
   if ($Terminate) {
     $target.Kill()
