@@ -78,7 +78,8 @@ function writeState(root, value) {
 
 /** Appearance file shared by the WPF ball (writer/reader) and the web client (read-only). */
 const APPEARANCE_ROUTE = '/dsh-quick-chat-appearance'
-const CLIENT_VERSION = '0.18.3'
+const BALANCE_ROUTE = '/dsh-quick-chat-balance'
+const CLIENT_VERSION = '0.19.0'
 
 function appearanceFilePath(root) {
   return join(root, 'appearance.json')
@@ -744,6 +745,58 @@ function createAppearanceHandler(root, ctx) {
   }
 }
 
+/**
+ * One-shot balance lookup for the native hover card. The native helper cannot
+ * resolve DSH credentials, so it asks the Host over loopback with the per-run
+ * token written into state.json.
+ */
+function createBalanceHandler(ctx, token, root) {
+  return async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost')
+    if (url.pathname !== BALANCE_ROUTE) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('not found')
+      return
+    }
+    if (req.method !== 'GET') {
+      res.writeHead(405, { allow: 'GET', 'content-type': 'text/plain; charset=utf-8' })
+      res.end('method not allowed')
+      return
+    }
+    if (req.headers['x-dsh-balance-token'] !== token) {
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('forbidden')
+      return
+    }
+
+    const send = (status, payload) => {
+      res.writeHead(status, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      })
+      res.end(JSON.stringify(payload))
+    }
+
+    try {
+      const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined
+      if (!account || typeof account.getBalance !== 'function') {
+        send(200, { status: 'unavailable' })
+        return
+      }
+      const language = readAppearance(root).language === 'en' ? 'en-US' : 'zh-CN'
+      const result = await account.getBalance({
+        version: CLIENT_VERSION,
+        locale: language,
+        timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+      })
+      send(200, result ?? { status: 'no-account' })
+    } catch (error) {
+      logHost(`balance lookup failed: ${error instanceof Error ? error.stack || error.message : String(error)}`)
+      send(200, { status: 'failed' })
+    }
+  }
+}
+
 function controlHelper(root, pid, terminate = false) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false
   const powershell = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
@@ -774,7 +827,7 @@ function killPreviousHelper(root) {
  * @param {import('@deepseek-ai/cordis').Context} ctx - Host context with connection and webServer.
  * @returns {() => void} disposer owned by the plugin fiber.
  */
-function startDesktopBall(ctx) {
+function startDesktopBall(ctx, balanceToken) {
   const root = localRoot()
   killPreviousHelper(root)
 
@@ -793,8 +846,16 @@ function startDesktopBall(ctx) {
     webviewProfile: join(root, 'webview-profile'),
     positionFile: join(root, 'ball-position.json'),
     log: join(root, 'ball.log'),
+    balanceUrl: `${base}${BALANCE_ROUTE}`,
+    balanceToken,
     labels: {
       tooltip: '桌面悬浮球：点击打开',
+      balanceLoading: '正在查询余额…',
+      balanceFailed: '余额获取失败',
+      balanceUnavailable: '当前版本不支持余额查询',
+      balanceNoAccount: '未登录 DeepSeek 账号',
+      balance: '余额',
+      bonus: '赠送',
       open: '打开桌面悬浮球',
       close: '关闭桌面悬浮球',
       icon: '更换悬浮球图标…',
@@ -873,8 +934,24 @@ export function apply(ctx) {
       `profile=${process.env.DSH_PROFILE || 'none'} shell=${process.env.DSH_SHELL || 'none'} argv=${process.argv.join(' ')}`,
   )
   if (!desktop) return
+
+  const balanceToken = randomBytes(16).toString('hex')
   try {
-    ctx.effect(() => startDesktopBall(ctx), 'quick-chat: desktop ball')
+    ctx.effect(
+      () =>
+        ctx.webServer.register({
+          kind: 'prefix',
+          path: BALANCE_ROUTE,
+          handler: createBalanceHandler(ctx, balanceToken, root),
+        }),
+      'quick-chat: balance route',
+    )
+  } catch (error) {
+    logHost(`balance route unavailable: ${error instanceof Error ? error.stack || error.message : String(error)}`)
+  }
+
+  try {
+    ctx.effect(() => startDesktopBall(ctx, balanceToken), 'quick-chat: desktop ball')
     logHost('desktop ball requested')
     console.info('[quick-chat] desktop ball requested')
   } catch (error) {

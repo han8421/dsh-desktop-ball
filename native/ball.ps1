@@ -14,8 +14,23 @@ using System;
 using System.Runtime.InteropServices;
 public static class DqcDpi
 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
 }
 '@
 try {
@@ -30,6 +45,45 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+
+# Do the balance HTTP request off the UI thread. The result is written to a
+# small file so PowerShell never has to marshal a WebClient event back into the
+# WPF runspace.
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Threading.Tasks;
+public static class DshBalanceFetcher
+{
+    public static void FetchToFile(string url, string token, string output)
+    {
+        Task.Run(() =>
+        {
+            string body = null, error = null;
+            try
+            {
+                using (var client = new WebClient())
+                {
+                    client.Proxy = null;
+                    client.Encoding = Encoding.UTF8;
+                    if (!string.IsNullOrEmpty(token)) client.Headers.Add("x-dsh-balance-token", token);
+                    body = client.DownloadString(url);
+                }
+            }
+            catch (Exception ex) { error = ex.Message; }
+            try
+            {
+                var temp = output + ".tmp";
+                File.WriteAllText(temp, error != null ? "ERROR:" + error : body, Encoding.UTF8);
+                File.Move(temp, output);
+            }
+            catch { }
+        });
+    }
+}
+'@
 
 # A warm-up window must not steal focus when it appears off-screen on hover.
 $script:canPrewarm = $false
@@ -200,6 +254,15 @@ $script:root = Split-Path -Parent $StatePath
 $script:pidPath = Join-Path $script:root 'ball.pid'
 $script:logPath = if ($script:state.log) { [string]$script:state.log } else { Join-Path $script:root 'ball.log' }
 $script:positionPath = if ($script:state.positionFile) { [string]$script:state.positionFile } else { Join-Path $script:root 'ball-position.json' }
+$script:balanceUrl = [string]$script:state.balanceUrl
+$script:balanceToken = [string]$script:state.balanceToken
+$script:balanceClient = $null
+$script:balancePollTimer = $null
+$script:balanceTempPath = $null
+$script:balanceTimeoutTimer = $null
+$script:balanceGeneration = 0
+$script:balanceToolTipText = $null
+$script:balanceToolTipLabel = '桌面悬浮球：点击打开'
 $script:chatSizePath = Join-Path $script:root 'chat-size.json'
 $script:chatWidth = 440.0
 $script:chatHeight = 660.0
@@ -238,6 +301,8 @@ $script:moved = $false
 $script:startLeft = 0.0
 $script:startTop = 0.0
 $script:startCursor = New-Object System.Drawing.Point(0, 0)
+$script:windowHandle = [IntPtr]::Zero
+$script:dragStartWindowRect = $null
 $script:dpiX = 1.0
 $script:dpiY = 1.0
 $script:appearancePath = Join-Path $script:root 'appearance.json'
@@ -722,6 +787,8 @@ function Read-State {
     $script:chatTitle = [string]$next.title
     $script:chatUrl = [string]$next.url
     $script:edgeProfile = [string]$next.edgeProfile
+    if ($next.balanceUrl) { $script:balanceUrl = [string]$next.balanceUrl }
+    if ($next.balanceToken) { $script:balanceToken = [string]$next.balanceToken }
     if ($next.webviewProfile) { $script:webviewProfile = [string]$next.webviewProfile }
     return $true
   } catch {
@@ -1365,9 +1432,71 @@ function End-ChatResize {
   Save-ChatSize
 }
 
+function Get-BallWindowRectPhysical {
+  if ($script:windowHandle -eq [IntPtr]::Zero) { return $null }
+  $rect = New-Object DqcDpi+RECT
+  if (-not [DqcDpi]::GetWindowRect($script:windowHandle, [ref]$rect)) { return $null }
+  return @{
+    left = [int]$rect.Left
+    top = [int]$rect.Top
+    width = [int]($rect.Right - $rect.Left)
+    height = [int]($rect.Bottom - $rect.Top)
+  }
+}
+
+function Set-BallWindowPhysicalPosition {
+  param([int]$X, [int]$Y)
+  if ($script:windowHandle -eq [IntPtr]::Zero) { return $false }
+  # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+  return [DqcDpi]::SetWindowPos($script:windowHandle, [IntPtr]::Zero, $X, $Y, 0, 0, 0x0015)
+}
+
 function Snap-BallToEdge {
   try {
     if (-not $script:moved) { return }
+    $rect = Get-BallWindowRectPhysical
+    if ($rect) {
+      $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window)
+      $scaleX = [Math]::Max(0.5, $dpi.DpiScaleX)
+      $scaleY = [Math]::Max(0.5, $dpi.DpiScaleY)
+      $screen = [System.Windows.Forms.Screen]::FromHandle($script:windowHandle)
+      $work = $screen.WorkingArea
+      $ballWidth = 60 * $scaleX
+      $ballHeight = 60 * $scaleY
+      $insetX = ($rect.width - $ballWidth) / 2
+      $insetY = ($rect.height - $ballHeight) / 2
+      $ballLeft = $rect.left + $insetX
+      $ballTop = $rect.top + $insetY
+      $ballRight = $ballLeft + $ballWidth
+      $ballBottom = $ballTop + $ballHeight
+      $gapX = 4 * $scaleX
+      $gapY = 4 * $scaleY
+      $thresholdX = 26 * $scaleX
+      $thresholdY = 26 * $scaleY
+      $targetLeft = $rect.left
+      $targetTop = $rect.top
+
+      if ([Math]::Abs($ballLeft - $work.Left) -le $thresholdX -and
+          [Math]::Abs($ballLeft - $work.Left) -le [Math]::Abs($work.Right - $ballRight)) {
+        $targetLeft = [int][Math]::Round($work.Left + $gapX - $insetX)
+      } elseif ([Math]::Abs($work.Right - $ballRight) -le $thresholdX) {
+        $targetLeft = [int][Math]::Round($work.Right - $gapX - $ballWidth - $insetX)
+      }
+      if ([Math]::Abs($ballTop - $work.Top) -le $thresholdY -and
+          [Math]::Abs($ballTop - $work.Top) -le [Math]::Abs($work.Bottom - $ballBottom)) {
+        $targetTop = [int][Math]::Round($work.Top + $gapY - $insetY)
+      } elseif ([Math]::Abs($work.Bottom - $ballBottom) -le $thresholdY) {
+        $targetTop = [int][Math]::Round($work.Bottom - $gapY - $ballHeight - $insetY)
+      }
+
+      if ([Math]::Abs($targetLeft - $rect.left) -gt 1 -or [Math]::Abs($targetTop - $rect.top) -gt 1) {
+        [void](Set-BallWindowPhysicalPosition $targetLeft $targetTop)
+        Write-BallLog ("ball snapped to {0},{1} physical" -f $targetLeft, $targetTop)
+      }
+      return
+    }
+
+    # Fallback for an early drag before the HWND exists.
     $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window)
     $scaleX = [Math]::Max(0.5, $dpi.DpiScaleX)
     $scaleY = [Math]::Max(0.5, $dpi.DpiScaleY)
@@ -1418,6 +1547,122 @@ function Snap-BallToEdge {
     Write-BallLog "ball snap failed: $_"
   }
 }
+
+function Set-BallTipText {
+  param([string]$Text)
+  if ($script:balanceToolTipText) {
+    $script:balanceToolTipText.Text = $Text
+  } elseif ($script:ball) {
+    $script:ball.ToolTip = $Text
+  }
+}
+
+function Format-BallWallet {
+  param($Wallet)
+  $balance = [string]$Wallet.balance
+  $amount = [decimal]0
+  if ([decimal]::TryParse(
+      $balance,
+      [System.Globalization.NumberStyles]::Number,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [ref]$amount
+    )) {
+    $balance = $amount.ToString('F2', [System.Globalization.CultureInfo]::InvariantCulture)
+  }
+  switch ([string]$Wallet.currency) {
+    'CNY' { return '¥' + $balance }
+    'USD' { return '$' + $balance }
+    default { return ([string]$Wallet.currency + ' ' + $balance) }
+  }
+}
+
+function Format-BallBalance {
+  param($Result)
+  if ($null -eq $Result) { return '未登录 DeepSeek 账号' }
+  switch ([string]$Result.status) {
+    'ready' {
+      $lines = @()
+      $recharge = @($Result.value | Where-Object { $_ })
+      if ($recharge.Count -eq 0) {
+        $lines += '余额 ¥0.00'
+      } else {
+        $lines += ('余额 ' + (($recharge | ForEach-Object { Format-BallWallet $_ }) -join ' / '))
+      }
+      $bonus = @($Result.bonusWallets | Where-Object { $_ })
+      if ($bonus.Count -gt 0) {
+        $lines += ('赠送 ' + (($bonus | ForEach-Object { Format-BallWallet $_ }) -join ' / '))
+      }
+      return ($lines -join "`n")
+    }
+    'no-account' { return '未登录 DeepSeek 账号' }
+    'unavailable' { return '当前版本不支持余额查询' }
+    default { return '余额获取失败' }
+  }
+}
+
+function Stop-BallBalanceRequest {
+  $script:balanceGeneration++
+  if ($script:balanceTimeoutTimer) {
+    try { $script:balanceTimeoutTimer.Stop() } catch { }
+    $script:balanceTimeoutTimer = $null
+  }
+  if ($script:balancePollTimer) {
+    try { $script:balancePollTimer.Stop() } catch { }
+    $script:balancePollTimer = $null
+  }
+  if ($script:balanceTempPath) {
+    try { Remove-Item -LiteralPath $script:balanceTempPath -Force -ErrorAction SilentlyContinue } catch { }
+    $script:balanceTempPath = $null
+  }
+}
+
+function Start-BallBalanceRequest {
+  if ([string]::IsNullOrWhiteSpace($script:balanceUrl)) { return }
+  Stop-BallBalanceRequest
+  $script:balanceGeneration++
+  $script:balanceActiveGeneration = $script:balanceGeneration
+  $path = Join-Path $script:root ('balance-' + [Guid]::NewGuid().ToString('N') + '.json')
+  $script:balanceTempPath = $path
+  try {
+    [DshBalanceFetcher]::FetchToFile($script:balanceUrl, $script:balanceToken, $path)
+    $poll = New-Object System.Windows.Threading.DispatcherTimer
+    $poll.Interval = [TimeSpan]::FromMilliseconds(120)
+    $poll.Add_Tick({
+      if ($script:balanceGeneration -ne $script:balanceActiveGeneration) { return }
+      if (-not (Test-Path -LiteralPath $script:balanceTempPath)) { return }
+      if ($script:balancePollTimer) { $script:balancePollTimer.Stop() }
+      try {
+        $raw = Get-Content -LiteralPath $script:balanceTempPath -Raw -Encoding UTF8
+        Remove-Item -LiteralPath $script:balanceTempPath -Force -ErrorAction SilentlyContinue
+        if ($raw -like 'ERROR:*') { throw 'balance request failed' }
+        $result = $raw | ConvertFrom-Json
+        Set-BallTipText (Format-BallBalance $result)
+      } catch {
+        Set-BallTipText '余额获取失败'
+      } finally {
+        if ($script:balanceTimeoutTimer) {
+          try { $script:balanceTimeoutTimer.Stop() } catch { }
+          $script:balanceTimeoutTimer = $null
+        }
+      }
+    })
+    $script:balancePollTimer = $poll
+    $poll.Start()
+
+    $script:balanceTimeoutTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:balanceTimeoutTimer.Interval = [TimeSpan]::FromSeconds(8)
+    $script:balanceTimeoutTimer.Add_Tick({
+      if ($script:balanceGeneration -ne $script:balanceActiveGeneration) { return }
+      Stop-BallBalanceRequest
+      Set-BallTipText '余额查询超时'
+    })
+    $script:balanceTimeoutTimer.Start()
+  } catch {
+    Set-BallTipText '余额获取失败'
+  }
+}
+
+$createdNew = $false
 
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Local\dsh-quick-chat-ball', [ref]$createdNew)
@@ -1519,6 +1764,28 @@ try {
     if ($script:state.labels.exit) { $menuExit.Header = [string]$script:state.labels.exit }
   }
 
+  $script:balanceToolTipLabel = if ($script:state.labels.tooltip) {
+    [string]$script:state.labels.tooltip
+  } else {
+    '桌面悬浮球：点击打开'
+  }
+  $script:balanceToolTipText = New-Object System.Windows.Controls.TextBlock
+  $script:balanceToolTipText.Text = $script:balanceToolTipLabel
+  $script:balanceToolTipText.TextWrapping = [System.Windows.TextWrapping]::Wrap
+  $script:balanceToolTipText.MaxWidth = 280
+  $script:balanceToolTipText.FontSize = 12.5
+  $balanceToolTip = New-Object System.Windows.Controls.ToolTip
+  $balanceToolTip.Content = $script:balanceToolTipText
+  $balanceToolTip.Padding = New-Object System.Windows.Thickness(10, 8, 10, 8)
+  $balanceToolTip.Background = [System.Windows.Media.Brushes]::White
+  $balanceToolTip.Foreground = [System.Windows.Media.Brushes]::Black
+  $ball.ToolTip = $balanceToolTip
+  [System.Windows.Controls.ToolTipService]::SetInitialShowDelay($ball, 2000)
+  [System.Windows.Controls.ToolTipService]::SetBetweenShowDelay($ball, 2000)
+  [System.Windows.Controls.ToolTipService]::SetShowDuration($ball, 60000)
+  $balanceUrlState = if ($script:balanceUrl) { 'yes' } else { 'no' }
+  Write-BallLog ("balance tooltip ready url={0}" -f $balanceUrlState)
+
   $script:ballVideo.Add_MediaOpened({
     try { $script:ballVideo.Play() } catch { }
   })
@@ -1538,6 +1805,7 @@ try {
     try {
       $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
       $handle = $helper.Handle
+      $script:windowHandle = $handle
       $style = [DqcBallNative]::GetWindowLong($handle, [DqcBallNative]::GWL_EXSTYLE)
       [void][DqcBallNative]::SetWindowLong($handle, [DqcBallNative]::GWL_EXSTYLE, ($style -bor [DqcBallNative]::WS_EX_TOOLWINDOW))
     } catch {
@@ -1554,7 +1822,23 @@ try {
       $script:dpiY = 1.0
     }
   })
+  try {
+    $window.Add_DpiChanged({
+      param($sender, $eventArgs)
+      try {
+        $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($script:window)
+        $script:dpiX = [Math]::Max(0.5, $dpi.DpiScaleX)
+        $script:dpiY = [Math]::Max(0.5, $dpi.DpiScaleY)
+        Write-BallLog ("ball dpi changed to {0}x{1}" -f $script:dpiX, $script:dpiY)
+      } catch {
+        Write-BallLog "ball dpi update failed: $_"
+      }
+    })
+  } catch {
+    Write-BallLog "ball dpi event unavailable: $_"
+  }
   $window.Add_Closed({
+    try { Stop-BallBalanceRequest } catch { }
     try { if ($script:appearanceTimer) { $script:appearanceTimer.Stop() } } catch { }
     try { if ($script:startupPrewarmTimer) { $script:startupPrewarmTimer.Stop() } } catch { }
     $script:startupPrewarmTimer = $null
@@ -1568,15 +1852,24 @@ try {
   $ball.Add_MouseEnter({
     $ballScale.ScaleX = 1.06
     $ballScale.ScaleY = 1.06
+    if (-not [string]::IsNullOrWhiteSpace($script:balanceUrl)) {
+      Set-BallTipText '正在查询余额…'
+      Start-BallBalanceRequest
+    }
     Prewarm-ChatWindow
   })
   $ball.Add_MouseLeave({
     $ballScale.ScaleX = 1.0
     $ballScale.ScaleY = 1.0
+    Stop-BallBalanceRequest
   })
   $ball.Add_MouseLeftButtonDown({
     $script:dragging = $true
     $script:moved = $false
+    if ($script:windowHandle -eq [IntPtr]::Zero) {
+      try { $script:windowHandle = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle } catch { }
+    }
+    $script:dragStartWindowRect = Get-BallWindowRectPhysical
     $script:startCursor = [System.Windows.Forms.Cursor]::Position
     $script:startLeft = [double]$window.Left
     $script:startTop = [double]$window.Top
@@ -1585,21 +1878,42 @@ try {
   $ball.Add_MouseMove({
     if (-not $script:dragging) { return }
     $current = [System.Windows.Forms.Cursor]::Position
-    $dx = ($current.X - $script:startCursor.X) / $script:dpiX
-    $dy = ($current.Y - $script:startCursor.Y) / $script:dpiY
-    if ([Math]::Abs($dx) + [Math]::Abs($dy) -gt 4) { $script:moved = $true }
-    if ($script:moved) {
-      $minX = [System.Windows.SystemParameters]::VirtualScreenLeft - 12
-      $minY = [System.Windows.SystemParameters]::VirtualScreenTop - 12
-      $maxX = $minX + [System.Windows.SystemParameters]::VirtualScreenWidth - $window.Width + 24
-      $maxY = $minY + [System.Windows.SystemParameters]::VirtualScreenHeight - $window.Height + 24
-      $window.Left = [Math]::Max($minX, [Math]::Min($maxX, $script:startLeft + $dx))
-      $window.Top = [Math]::Max($minY, [Math]::Min($maxY, $script:startTop + $dy))
+    $physicalDx = $current.X - $script:startCursor.X
+    $physicalDy = $current.Y - $script:startCursor.Y
+    if ([Math]::Abs($physicalDx) + [Math]::Abs($physicalDy) -gt 4) { $script:moved = $true }
+    if (-not $script:moved) { return }
+
+    if ($script:dragStartWindowRect -and $script:windowHandle -ne [IntPtr]::Zero) {
+      # Move in physical pixels. Window.Left/Top are DIPs and their DPI can
+      # change when the window crosses monitors; mixing both coordinate
+      # spaces is what made the ball stop at stale drag boundaries.
+      $virtual = [System.Windows.Forms.SystemInformation]::VirtualScreen
+      $width = [int]$script:dragStartWindowRect.width
+      $height = [int]$script:dragStartWindowRect.height
+      $minX = $virtual.Left - 12
+      $minY = $virtual.Top - 12
+      $maxX = $virtual.Right - $width + 24
+      $maxY = $virtual.Bottom - $height + 24
+      $targetX = [Math]::Max($minX, [Math]::Min($maxX, $script:dragStartWindowRect.left + $physicalDx))
+      $targetY = [Math]::Max($minY, [Math]::Min($maxY, $script:dragStartWindowRect.top + $physicalDy))
+      [void](Set-BallWindowPhysicalPosition $targetX $targetY)
+      return
     }
+
+    # Fallback for a window without an HWND yet.
+    $dx = $physicalDx / $script:dpiX
+    $dy = $physicalDy / $script:dpiY
+    $minX = [System.Windows.SystemParameters]::VirtualScreenLeft - 12
+    $minY = [System.Windows.SystemParameters]::VirtualScreenTop - 12
+    $maxX = $minX + [System.Windows.SystemParameters]::VirtualScreenWidth - $window.Width + 24
+    $maxY = $minY + [System.Windows.SystemParameters]::VirtualScreenHeight - $window.Height + 24
+    $window.Left = [Math]::Max($minX, [Math]::Min($maxX, $script:startLeft + $dx))
+    $window.Top = [Math]::Max($minY, [Math]::Min($maxY, $script:startTop + $dy))
   })
   $ball.Add_MouseLeftButtonUp({
     if (-not $script:dragging) { return }
     $script:dragging = $false
+    $script:dragStartWindowRect = $null
     [void]$ball.ReleaseMouseCapture()
     if ($script:moved) {
       Snap-BallToEdge
