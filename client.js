@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } = React
 
     const PLUGIN_ID = 'dsh-desktop-ball'
-    const VERSION = '0.19.0'
+    const VERSION = '0.19.1'
     // Keep the original storage key so upgrading users retain history and preferences.
     const STORAGE_KEY = 'dsh-quick-chat.prefs.v1'
     const PANEL_MIN_WIDTH = 340
@@ -6975,7 +6975,7 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
     // Plugin entry
     // ---------------------------------------------------------------------
 
-    const inject = ['slots', 'sessions', 'remote', 'remote.userQuestions', 'remote.workspace', 'remote.directoryPicker', 'uiSession']
+    const inject = ['slots', 'sessions', 'remote', 'remote.userQuestions', 'remote.workspace', 'remote.directoryPicker', 'fileUpload', 'uiSession']
 
     function apply(ctx) {
       let style = document.getElementById('dsh-desktop-ball-style')

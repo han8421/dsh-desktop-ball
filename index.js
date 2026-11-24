@@ -79,7 +79,7 @@ function writeState(root, value) {
 /** Appearance file shared by the WPF ball (writer/reader) and the web client (read-only). */
 const APPEARANCE_ROUTE = '/dsh-quick-chat-appearance'
 const BALANCE_ROUTE = '/dsh-quick-chat-balance'
-const CLIENT_VERSION = '0.19.0'
+const CLIENT_VERSION = '0.19.1'
 
 function appearanceFilePath(root) {
   return join(root, 'appearance.json')
