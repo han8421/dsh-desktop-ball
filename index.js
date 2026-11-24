@@ -79,29 +79,54 @@ function writeState(root, value) {
 /** Appearance file shared by the WPF ball (writer/reader) and the web client (read-only). */
 const APPEARANCE_ROUTE = '/dsh-quick-chat-appearance'
 const BALANCE_ROUTE = '/dsh-quick-chat-balance'
-const CLIENT_VERSION = '0.19.2'
+const CLIENT_VERSION = '0.19.3'
 
 function appearanceFilePath(root) {
   return join(root, 'appearance.json')
 }
+
+/** Last successfully parsed appearance per profile root, used only if a read hits a rename race. */
+const lastGoodAppearance = new Map()
 
 function readAppearance(root) {
   try {
     // Windows PowerShell writes UTF-8 with a BOM; JSON.parse does not accept it.
     const raw = readFileSync(appearanceFilePath(root), 'utf8').replace(/^\uFEFF/, '')
     const value = JSON.parse(raw)
-    return value && typeof value === 'object' ? value : {}
+    if (value && typeof value === 'object') {
+      lastGoodAppearance.set(root, value)
+      return value
+    }
+    return lastGoodAppearance.get(root) ?? {}
   } catch {
-    return {}
+    return lastGoodAppearance.get(root) ?? {}
+  }
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
+}
+
+function renameAppearanceWithRetry(from, to) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (error) {
+      const retryable = error && (error.code === 'EPERM' || error.code === 'EBUSY' || error.code === 'EACCES')
+      if (!retryable || attempt === 4) throw error
+      sleepSync(25)
+    }
   }
 }
 
 function writeAppearance(root, value) {
   mkdirSync(root, { recursive: true })
   const file = appearanceFilePath(root)
-  const temp = file + '.tmp'
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`
   writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
-  renameSync(temp, file)
+  renameAppearanceWithRetry(temp, file)
+  lastGoodAppearance.set(root, value)
   pruneMedia(root, value, error => logHost(`media cleanup failed: ${error.message}`))
 }
 

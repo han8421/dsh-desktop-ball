@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } = React
 
     const PLUGIN_ID = 'dsh-desktop-ball'
-    const VERSION = '0.19.2'
+    const VERSION = '0.19.3'
     // Keep the original storage key so upgrading users retain history and preferences.
     const STORAGE_KEY = 'dsh-quick-chat.prefs.v1'
     const PANEL_MIN_WIDTH = 340
@@ -5025,7 +5025,7 @@ html[data-dqc-standalone="1"] body{background:var(--dsw-alias-bg-base,#f7f8fa)}
           }
         }
         void load()
-        const timer = setInterval(load, 3000)
+        const timer = setInterval(load, 1000)
         return () => {
           alive = false
           clearInterval(timer)

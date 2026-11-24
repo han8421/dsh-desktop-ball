@@ -265,6 +265,7 @@ $script:balanceInFlight = $false
 $script:balanceLastText = ''
 $script:balanceLastAt = [DateTime]::MinValue
 $script:balancePrefetchTimer = $null
+$script:balanceCleanupTimer = $null
 $script:hoverPrewarmTimer = $null
 $script:balanceToolTipText = $null
 $script:balanceToolTipLabel = '桌面悬浮球：点击打开'
@@ -319,6 +320,9 @@ $script:gifDelays = @()
 $script:gifIndex = 0
 $script:appearanceTimer = $null
 $script:appearanceStamp = ''
+$script:appearanceApplyOk = $true
+$script:appearanceErrorStamp = ''
+$script:appearanceApplyErrorStamp = ''
 $script:lastBallClickAt = [DateTime]::MinValue
 $script:ballGradient = $null
 $script:defaultBallFill = $null
@@ -360,14 +364,34 @@ function Initialize-WebView2 {
   }
 }
 
-function Read-Appearance {
+function Get-AppearanceStamp {
   try {
-    if (-not (Test-Path -LiteralPath $script:appearancePath)) { return $null }
-    return Get-Content -LiteralPath $script:appearancePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath $script:appearancePath)) { return '' }
+    $file = Get-Item -LiteralPath $script:appearancePath
+    return ('{0}:{1}' -f $file.LastWriteTimeUtc.Ticks, $file.Length)
   } catch {
-    Write-BallLog "appearance read failed: $_"
-    return $null
+    return ''
   }
+}
+
+function Read-AppearanceState {
+  if (-not (Test-Path -LiteralPath $script:appearancePath)) {
+    return @{ status = 'missing'; value = $null; error = $null }
+  }
+  $lastError = $null
+  for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    try {
+      $text = [System.IO.File]::ReadAllText($script:appearancePath, [System.Text.Encoding]::UTF8)
+      if ([string]::IsNullOrWhiteSpace($text)) { throw 'appearance file is empty' }
+      $value = $text | ConvertFrom-Json
+      if ($null -eq $value) { throw 'appearance file has no object' }
+      return @{ status = 'ok'; value = $value; error = $null }
+    } catch {
+      $lastError = $_
+      if ($attempt -lt 2) { Start-Sleep -Milliseconds 80 }
+    }
+  }
+  return @{ status = 'error'; value = $null; error = $lastError }
 }
 
 function Write-Appearance {
@@ -573,7 +597,6 @@ function Set-BallColor {
 
 function Set-BallImage {
   param([string]$File)
-  Stop-BallMedia
   $frame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
     (New-Object System.Uri($File, [System.UriKind]::Absolute)),
     [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
@@ -581,6 +604,7 @@ function Set-BallImage {
   )
   $cropped = Get-CroppedBallFrame $frame
   if ($cropped -and $cropped.CanFreeze) { $cropped.Freeze() }
+  Stop-BallMedia
   $script:ballImage.Source = $cropped
   $script:ballImage.Visibility = [System.Windows.Visibility]::Visible
   $script:ballVideo.Visibility = [System.Windows.Visibility]::Collapsed
@@ -593,7 +617,6 @@ function Set-BallImage {
 
 function Set-BallGif {
   param([string]$File)
-  Stop-BallMedia
 
   # WPF's GifBitmapDecoder returns wrong palettes for frames after the first
   # (the image turns into a black/white dither). GDI+ composites GIF frames
@@ -672,6 +695,7 @@ function Set-BallGif {
   }
 
   if ($frames.Count -eq 0) { throw 'GIF 没有可播放的帧' }
+  Stop-BallMedia
   $script:gifFrames = $frames
   $script:gifDelays = $delays
   $script:gifIndex = 0
@@ -714,12 +738,14 @@ function Set-BallVideo {
 
 function Apply-BallAppearance {
   param($Appearance)
+  $script:appearanceApplyOk = $true
   if (-not $Appearance) {
     $script:ballShape = 'circle'
     $script:ballSize = 60
     $script:ballCrop = $null
     Set-BallBuiltin
     Update-BallGeometry
+    $script:appearanceApplyErrorStamp = ''
     return
   }
   try {
@@ -758,17 +784,23 @@ function Apply-BallAppearance {
     Set-BallColor ([string]$Appearance.ballColor)
     Write-BallLog ("ball appearance applied: kind=color color={0}" -f $Appearance.ballColor)
     Update-BallGeometry
+    $script:appearanceApplyErrorStamp = ''
     return
   }
   if ($kind -eq 'builtin') {
     Set-BallBuiltin
     Update-BallGeometry
+    $script:appearanceApplyErrorStamp = ''
     return
   }
   $file = [string]$Appearance.ballFile
   if ([string]::IsNullOrWhiteSpace($file) -or -not (Test-Path -LiteralPath $file)) {
-    Set-BallBuiltin
-    Update-BallGeometry
+    $script:appearanceApplyOk = $false
+    $errorStamp = Get-AppearanceStamp
+    if ($script:appearanceApplyErrorStamp -ne $errorStamp) {
+      $script:appearanceApplyErrorStamp = $errorStamp
+      Write-BallLog ("ball appearance file missing: {0}" -f $file)
+    }
     return
   }
   if ([string]::IsNullOrWhiteSpace($kind)) { $kind = Ball-KindOf $file }
@@ -779,9 +811,15 @@ function Apply-BallAppearance {
       default { Set-BallImage $file }
     }
     Write-BallLog ("ball appearance applied: kind={0} file={1}" -f $kind, $file)
+    $script:appearanceApplyErrorStamp = ''
   } catch {
-    Write-BallLog "ball appearance failed: $_"
-    Set-BallBuiltin
+    $script:appearanceApplyOk = $false
+    $errorStamp = Get-AppearanceStamp
+    if ($script:appearanceApplyErrorStamp -ne $errorStamp) {
+      $script:appearanceApplyErrorStamp = $errorStamp
+      Write-BallLog "ball appearance failed: $_"
+    }
+    return
   }
   Update-BallGeometry
 }
@@ -1605,6 +1643,15 @@ function Format-BallBalance {
   }
 }
 
+function Remove-StaleBalanceTempFiles {
+  try {
+    $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-2)
+    Get-ChildItem -LiteralPath $script:root -Filter 'balance-*.json' -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  } catch { }
+}
+
 function Stop-BallBalanceRequest {
   $script:balanceGeneration++
   $script:balanceInFlight = $false
@@ -1809,6 +1856,11 @@ try {
   [System.Windows.Controls.ToolTipService]::SetShowDuration($ball, 60000)
   $balanceUrlState = if ($script:balanceUrl) { 'yes' } else { 'no' }
   Write-BallLog ("balance tooltip ready url={0}" -f $balanceUrlState)
+  Remove-StaleBalanceTempFiles
+  $script:balanceCleanupTimer = New-Object System.Windows.Threading.DispatcherTimer
+  $script:balanceCleanupTimer.Interval = [TimeSpan]::FromMinutes(10)
+  $script:balanceCleanupTimer.Add_Tick({ Remove-StaleBalanceTempFiles })
+  $script:balanceCleanupTimer.Start()
 
   if ($script:balanceUrl) {
     $script:balancePrefetchTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1875,8 +1927,10 @@ try {
   $window.Add_Closed({
     try { Stop-BallBalanceRequest } catch { }
     try { if ($script:balancePrefetchTimer) { $script:balancePrefetchTimer.Stop() } } catch { }
+    try { if ($script:balanceCleanupTimer) { $script:balanceCleanupTimer.Stop() } } catch { }
     try { if ($script:hoverPrewarmTimer) { $script:hoverPrewarmTimer.Stop() } } catch { }
     $script:balancePrefetchTimer = $null
+    $script:balanceCleanupTimer = $null
     $script:hoverPrewarmTimer = $null
     try { if ($script:appearanceTimer) { $script:appearanceTimer.Stop() } } catch { }
     try { if ($script:startupPrewarmTimer) { $script:startupPrewarmTimer.Stop() } } catch { }
@@ -2039,12 +2093,22 @@ try {
   $timer.Start()
 
   $window.Show()
-  try { Apply-BallAppearance (Read-Appearance) } catch { Write-BallLog "initial ball appearance failed: $_" }
+  $initialAppearance = Read-AppearanceState
   try {
-    $script:appearanceStamp = if (Test-Path -LiteralPath $script:appearancePath) {
-      (Get-Item -LiteralPath $script:appearancePath).LastWriteTimeUtc.Ticks.ToString()
-    } else { '' }
-  } catch { $script:appearanceStamp = '' }
+    if ($initialAppearance.status -eq 'ok') {
+      Apply-BallAppearance $initialAppearance.value
+      $script:appearanceStamp = if ($script:appearanceApplyOk) { Get-AppearanceStamp } else { '' }
+    } else {
+      Apply-BallAppearance $null
+      $script:appearanceStamp = ''
+      if ($initialAppearance.status -eq 'error') {
+        Write-BallLog ("initial appearance read failed: {0}" -f $initialAppearance.error)
+      }
+    }
+  } catch {
+    Write-BallLog "initial ball appearance failed: $_"
+    $script:appearanceStamp = ''
+  }
   $script:appearanceTimer = New-Object System.Windows.Threading.DispatcherTimer
   $script:appearanceTimer.Interval = [TimeSpan]::FromSeconds(1)
   $script:appearanceTimer.Add_Tick({
@@ -2054,14 +2118,30 @@ try {
         Write-BallLog 'open request from host'
         Open-Chat
       }
-      $stamp = if (Test-Path -LiteralPath $script:appearancePath) {
-        (Get-Item -LiteralPath $script:appearancePath).LastWriteTimeUtc.Ticks.ToString()
-      } else { '' }
-      if ($stamp -ne $script:appearanceStamp) {
-        $script:appearanceStamp = $stamp
-        Apply-BallAppearance (Read-Appearance)
+      $stamp = Get-AppearanceStamp
+      if ($stamp -eq $script:appearanceStamp) { return }
+      $state = Read-AppearanceState
+      if ($state.status -eq 'missing') {
+        # A rename can make the path briefly disappear. Keep the current ball
+        # and wait for the next tick instead of flashing the built-in icon.
+        $script:appearanceStamp = ''
+        return
       }
-    } catch { }
+      if ($state.status -eq 'error') {
+        if ($script:appearanceErrorStamp -ne $stamp) {
+          $script:appearanceErrorStamp = $stamp
+          Write-BallLog ("appearance read failed; will retry: {0}" -f $state.error)
+        }
+        return
+      }
+      Apply-BallAppearance $state.value
+      if ($script:appearanceApplyOk) {
+        $script:appearanceStamp = $stamp
+        $script:appearanceErrorStamp = ''
+      }
+    } catch {
+      Write-BallLog "appearance poll failed: $_"
+    }
   })
   $script:appearanceTimer.Start()
   Write-BallLog "ball shown for host pid $script:dshPid"
