@@ -261,6 +261,11 @@ $script:balancePollTimer = $null
 $script:balanceTempPath = $null
 $script:balanceTimeoutTimer = $null
 $script:balanceGeneration = 0
+$script:balanceInFlight = $false
+$script:balanceLastText = ''
+$script:balanceLastAt = [DateTime]::MinValue
+$script:balancePrefetchTimer = $null
+$script:hoverPrewarmTimer = $null
 $script:balanceToolTipText = $null
 $script:balanceToolTipLabel = '桌面悬浮球：点击打开'
 $script:chatSizePath = Join-Path $script:root 'chat-size.json'
@@ -1602,6 +1607,7 @@ function Format-BallBalance {
 
 function Stop-BallBalanceRequest {
   $script:balanceGeneration++
+  $script:balanceInFlight = $false
   if ($script:balanceTimeoutTimer) {
     try { $script:balanceTimeoutTimer.Stop() } catch { }
     $script:balanceTimeoutTimer = $null
@@ -1621,6 +1627,7 @@ function Start-BallBalanceRequest {
   Stop-BallBalanceRequest
   $script:balanceGeneration++
   $script:balanceActiveGeneration = $script:balanceGeneration
+  $script:balanceInFlight = $true
   $path = Join-Path $script:root ('balance-' + [Guid]::NewGuid().ToString('N') + '.json')
   $script:balanceTempPath = $path
   try {
@@ -1636,9 +1643,18 @@ function Start-BallBalanceRequest {
         Remove-Item -LiteralPath $script:balanceTempPath -Force -ErrorAction SilentlyContinue
         if ($raw -like 'ERROR:*') { throw 'balance request failed' }
         $result = $raw | ConvertFrom-Json
-        Set-BallTipText (Format-BallBalance $result)
+        $formatted = Format-BallBalance $result
+        $script:balanceLastText = $formatted
+        $script:balanceLastAt = [DateTime]::UtcNow
+        $script:balanceInFlight = $false
+        Set-BallTipText $formatted
       } catch {
-        Set-BallTipText '余额获取失败'
+        $script:balanceInFlight = $false
+        if ($script:balanceLastText) {
+          Set-BallTipText $script:balanceLastText
+        } else {
+          Set-BallTipText '余额获取失败'
+        }
       } finally {
         if ($script:balanceTimeoutTimer) {
           try { $script:balanceTimeoutTimer.Stop() } catch { }
@@ -1653,16 +1669,24 @@ function Start-BallBalanceRequest {
     $script:balanceTimeoutTimer.Interval = [TimeSpan]::FromSeconds(8)
     $script:balanceTimeoutTimer.Add_Tick({
       if ($script:balanceGeneration -ne $script:balanceActiveGeneration) { return }
+      $lastText = $script:balanceLastText
       Stop-BallBalanceRequest
-      Set-BallTipText '余额查询超时'
+      if ($lastText) {
+        Set-BallTipText $lastText
+      } else {
+        Set-BallTipText '余额查询超时'
+      }
     })
     $script:balanceTimeoutTimer.Start()
   } catch {
-    Set-BallTipText '余额获取失败'
+    $script:balanceInFlight = $false
+    if ($script:balanceLastText) {
+      Set-BallTipText $script:balanceLastText
+    } else {
+      Set-BallTipText '余额获取失败'
+    }
   }
 }
-
-$createdNew = $false
 
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Local\dsh-quick-chat-ball', [ref]$createdNew)
@@ -1780,11 +1804,22 @@ try {
   $balanceToolTip.Background = [System.Windows.Media.Brushes]::White
   $balanceToolTip.Foreground = [System.Windows.Media.Brushes]::Black
   $ball.ToolTip = $balanceToolTip
-  [System.Windows.Controls.ToolTipService]::SetInitialShowDelay($ball, 2000)
-  [System.Windows.Controls.ToolTipService]::SetBetweenShowDelay($ball, 2000)
+  [System.Windows.Controls.ToolTipService]::SetInitialShowDelay($ball, 1500)
+  [System.Windows.Controls.ToolTipService]::SetBetweenShowDelay($ball, 1500)
   [System.Windows.Controls.ToolTipService]::SetShowDuration($ball, 60000)
   $balanceUrlState = if ($script:balanceUrl) { 'yes' } else { 'no' }
   Write-BallLog ("balance tooltip ready url={0}" -f $balanceUrlState)
+
+  if ($script:balanceUrl) {
+    $script:balancePrefetchTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:balancePrefetchTimer.Interval = [TimeSpan]::FromMilliseconds(300)
+    $script:balancePrefetchTimer.Add_Tick({
+      if ($script:balancePrefetchTimer) { $script:balancePrefetchTimer.Stop() }
+      $script:balancePrefetchTimer = $null
+      if (-not $script:balanceInFlight) { Start-BallBalanceRequest }
+    })
+    $script:balancePrefetchTimer.Start()
+  }
 
   $script:ballVideo.Add_MediaOpened({
     try { $script:ballVideo.Play() } catch { }
@@ -1839,6 +1874,10 @@ try {
   }
   $window.Add_Closed({
     try { Stop-BallBalanceRequest } catch { }
+    try { if ($script:balancePrefetchTimer) { $script:balancePrefetchTimer.Stop() } } catch { }
+    try { if ($script:hoverPrewarmTimer) { $script:hoverPrewarmTimer.Stop() } } catch { }
+    $script:balancePrefetchTimer = $null
+    $script:hoverPrewarmTimer = $null
     try { if ($script:appearanceTimer) { $script:appearanceTimer.Stop() } } catch { }
     try { if ($script:startupPrewarmTimer) { $script:startupPrewarmTimer.Stop() } } catch { }
     $script:startupPrewarmTimer = $null
@@ -1853,10 +1892,26 @@ try {
     $ballScale.ScaleX = 1.06
     $ballScale.ScaleY = 1.06
     if (-not [string]::IsNullOrWhiteSpace($script:balanceUrl)) {
-      Set-BallTipText '正在查询余额…'
-      Start-BallBalanceRequest
+      if ($script:balanceLastText) {
+        Set-BallTipText $script:balanceLastText
+      } else {
+        Set-BallTipText '正在查询余额…'
+      }
+      if (-not $script:balanceInFlight) {
+        Start-BallBalanceRequest
+      }
     }
-    Prewarm-ChatWindow
+    # Do not let the first WebView warm-up block the 1.5s tooltip timer.
+    if (-not $script:hoverPrewarmTimer) {
+      $script:hoverPrewarmTimer = New-Object System.Windows.Threading.DispatcherTimer
+      $script:hoverPrewarmTimer.Interval = [TimeSpan]::FromMilliseconds(60)
+      $script:hoverPrewarmTimer.Add_Tick({
+        if ($script:hoverPrewarmTimer) { $script:hoverPrewarmTimer.Stop() }
+        $script:hoverPrewarmTimer = $null
+        Prewarm-ChatWindow
+      })
+      $script:hoverPrewarmTimer.Start()
+    }
   })
   $ball.Add_MouseLeave({
     $ballScale.ScaleX = 1.0

@@ -79,7 +79,7 @@ function writeState(root, value) {
 /** Appearance file shared by the WPF ball (writer/reader) and the web client (read-only). */
 const APPEARANCE_ROUTE = '/dsh-quick-chat-appearance'
 const BALANCE_ROUTE = '/dsh-quick-chat-balance'
-const CLIENT_VERSION = '0.19.1'
+const CLIENT_VERSION = '0.19.2'
 
 function appearanceFilePath(root) {
   return join(root, 'appearance.json')
@@ -751,6 +751,8 @@ function createAppearanceHandler(root, ctx) {
  * token written into state.json.
  */
 function createBalanceHandler(ctx, token, root) {
+  let cachedAt = 0
+  let cached = null
   return async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost')
     if (url.pathname !== BALANCE_ROUTE) {
@@ -777,6 +779,11 @@ function createBalanceHandler(ctx, token, root) {
       res.end(JSON.stringify(payload))
     }
 
+    if (cached && Date.now() - cachedAt < 10000) {
+      send(200, cached)
+      return
+    }
+
     try {
       const account = typeof ctx.get === 'function' ? ctx.get('deepseekAccount') : undefined
       if (!account || typeof account.getBalance !== 'function') {
@@ -789,7 +796,12 @@ function createBalanceHandler(ctx, token, root) {
         locale: language,
         timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
       })
-      send(200, result ?? { status: 'no-account' })
+      const payload = result ?? { status: 'no-account' }
+      if (payload && payload.status === 'ready') {
+        cached = payload
+        cachedAt = Date.now()
+      }
+      send(200, payload)
     } catch (error) {
       logHost(`balance lookup failed: ${error instanceof Error ? error.stack || error.message : String(error)}`)
       send(200, { status: 'failed' })
